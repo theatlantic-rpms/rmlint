@@ -1,0 +1,25 @@
+From 2b9eeacc49ffc4c32a5bfb4bf42709bca1bb70ed Mon Sep 17 00:00:00 2001
+From: Frankie Dintino <fdintino@gmail.com>
+Date: Mon, 18 Sep 2017 23:21:08 -0400
+Subject: [PATCH 1/2] python 2.6 compat
+
+---
+ SConstruct | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/SConstruct b/SConstruct
+index f8e2b10..d4dec7f 100755
+--- a/SConstruct
++++ b/SConstruct
+@@ -377,7 +377,7 @@ def find_sphinx_binary():
+ 
+     binaries = sorted(binaries, key=version_key, reverse=True)
+     if binaries:
+-        print('Using sphinx-build binary: {}'.format(binaries[0]))
++        print('Using sphinx-build binary: %s' % binaries[0])
+         return binaries[0]
+     else:
+         print('Unable to find sphinx binary in PATH')
+-- 
+2.11.0
+

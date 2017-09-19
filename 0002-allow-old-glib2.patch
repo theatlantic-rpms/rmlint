@@ -1,0 +1,442 @@
+From da0ecae3100adf6749aebcd53ceb2623c7cb5917 Mon Sep 17 00:00:00 2001
+From: Frankie Dintino <fdintino@gmail.com>
+Date: Mon, 18 Sep 2017 23:21:27 -0400
+Subject: [PATCH 2/2] allow old glib2
+
+---
+ SConstruct         |   2 +-
+ lib/checksum.h     | 200 ++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ lib/formats.h      |   2 +-
+ lib/hash-utility.c |   2 +-
+ lib/hasher.c       |   4 +-
+ lib/md-scheduler.c |   8 +--
+ lib/pathtricia.h   |   3 +-
+ lib/session.h      |   2 +-
+ lib/shredder.c     |  14 ++--
+ lib/utilities.c    |   2 +-
+ lib/utilities.h    |   4 +-
+ 11 files changed, 222 insertions(+), 21 deletions(-)
+
+diff --git a/SConstruct b/SConstruct
+index d4dec7f..13d1dc2 100755
+--- a/SConstruct
++++ b/SConstruct
+@@ -538,7 +538,7 @@ conf.check_pkgconfig('0.15.0')
+ 
+ # Pkg-config to internal name
+ conf.env['HAVE_GLIB'] = 0
+-conf.check_pkg('glib-2.0 >= 2.32', 'HAVE_GLIB', required=True)
++conf.check_pkg('glib-2.0', 'HAVE_GLIB', required=True)
+ 
+ conf.env['HAVE_GIO_UNIX'] = 0
+ conf.check_pkg('gio-unix-2.0', 'HAVE_GIO_UNIX', required=False)
+diff --git a/lib/checksum.h b/lib/checksum.h
+index 708ea35..92722c3 100644
+--- a/lib/checksum.h
++++ b/lib/checksum.h
+@@ -33,6 +33,202 @@
+ #include "checksums/blake2/blake2.h"
+ #include "checksums/sha3/sha3.h"
+ 
++#if !GLIB_CHECK_VERSION(2,29,16)
++static inline GPtrArray *
++g_ptr_array_new_full(guint reserved_size,
++               GDestroyNotify element_free_func)
++{
++       GPtrArray *array;
++       array = g_ptr_array_sized_new(reserved_size);
++       g_ptr_array_set_free_func(array, element_free_func);
++       return array;
++}
++#endif
++
++#if !GLIB_CHECK_VERSION(2, 32, 0)
++static inline GByteArray * g_byte_array_new_take(guint8 *data, gsize len)
++{
++    GByteArray *array;
++
++    array = g_byte_array_new();
++    g_byte_array_append(array, data, len);
++    g_free(data);
++
++    return array;
++}
++
++static inline void g_queue_free_full(GQueue *queue, GDestroyNotify free_func)
++{
++    g_queue_foreach(queue, (GFunc)free_func, NULL);
++    g_queue_free(queue);
++}
++
++/* Beware, function returns gboolean since 2.39.2, see GLib commit 9101915 */
++static inline void g_hash_table_add(GHashTable *hash_table, gpointer key)
++{
++    g_hash_table_replace(hash_table, key, key);
++}
++
++static inline gboolean g_hash_table_contains(GHashTable *hash_table,
++                                             gpointer key)
++{
++    return g_hash_table_lookup_extended(hash_table, key, NULL, NULL);
++}
++#endif
++
++#if !GLIB_CHECK_VERSION(2, 31, 0)
++/* before glib-2.31, GMutex and GCond was dynamic-only (there was a separate
++ * GStaticMutex, but it didn't work with condition variables).
++ *
++ * Our implementation uses GOnce to fake a static implementation that does
++ * not require separate initialization.
++ * We need to rename the types to avoid passing our CompatGMutex/CompatGCond
++ * by mistake to a function that expects GMutex/GCond.  However, for ease
++ * of use we keep the GLib function names.  GLib uses macros for the
++ * implementation, we use inline functions instead and undefine the macros.
++ */
++
++typedef struct CompatGMutex {
++    GOnce once;
++} CompatGMutex;
++
++typedef struct CompatGCond {
++    GOnce once;
++} CompatGCond;
++
++static inline gpointer do_g_mutex_new(gpointer unused)
++{
++    return (gpointer) g_mutex_new();
++}
++
++static inline void g_mutex_init(CompatGMutex *mutex)
++{
++    mutex->once = (GOnce) G_ONCE_INIT;
++}
++
++static inline void g_mutex_clear(CompatGMutex *mutex)
++{
++    g_assert(mutex->once.status != G_ONCE_STATUS_PROGRESS);
++    if (mutex->once.retval) {
++        g_mutex_free((GMutex *) mutex->once.retval);
++    }
++    mutex->once = (GOnce) G_ONCE_INIT;
++}
++
++static inline void (g_mutex_lock)(CompatGMutex *mutex)
++{
++    g_once(&mutex->once, do_g_mutex_new, NULL);
++    g_mutex_lock((GMutex *) mutex->once.retval);
++}
++#undef g_mutex_lock
++
++static inline gboolean (g_mutex_trylock)(CompatGMutex *mutex)
++{
++    g_once(&mutex->once, do_g_mutex_new, NULL);
++    return g_mutex_trylock((GMutex *) mutex->once.retval);
++}
++#undef g_mutex_trylock
++
++
++static inline void (g_mutex_unlock)(CompatGMutex *mutex)
++{
++    g_mutex_unlock((GMutex *) mutex->once.retval);
++}
++#undef g_mutex_unlock
++
++static inline gpointer do_g_cond_new(gpointer unused)
++{
++    return (gpointer) g_cond_new();
++}
++
++static inline void g_cond_init(CompatGCond *cond)
++{
++    cond->once = (GOnce) G_ONCE_INIT;
++}
++
++static inline void g_cond_clear(CompatGCond *cond)
++{
++    g_assert(cond->once.status != G_ONCE_STATUS_PROGRESS);
++    if (cond->once.retval) {
++        g_cond_free((GCond *) cond->once.retval);
++    }
++    cond->once = (GOnce) G_ONCE_INIT;
++}
++
++static inline void (g_cond_wait)(CompatGCond *cond, CompatGMutex *mutex)
++{
++    g_assert(mutex->once.status != G_ONCE_STATUS_PROGRESS);
++    g_once(&cond->once, do_g_cond_new, NULL);
++    g_cond_wait((GCond *) cond->once.retval, (GMutex *) mutex->once.retval);
++}
++#undef g_cond_wait
++
++static inline void (g_cond_broadcast)(CompatGCond *cond)
++{
++    g_once(&cond->once, do_g_cond_new, NULL);
++    g_cond_broadcast((GCond *) cond->once.retval);
++}
++#undef g_cond_broadcast
++
++static inline void (g_cond_signal)(CompatGCond *cond)
++{
++    g_once(&cond->once, do_g_cond_new, NULL);
++    g_cond_signal((GCond *) cond->once.retval);
++}
++#undef g_cond_signal
++
++static inline gboolean (g_cond_timed_wait)(CompatGCond *cond,
++                                           CompatGMutex *mutex,
++                                           GTimeVal *time)
++{
++    g_assert(mutex->once.status != G_ONCE_STATUS_PROGRESS);
++    g_once(&cond->once, do_g_cond_new, NULL);
++    return g_cond_timed_wait((GCond *) cond->once.retval,
++                             (GMutex *) mutex->once.retval, time);
++}
++#undef g_cond_timed_wait
++
++/* This is not a macro, because it didn't exist until 2.32.  */
++static inline gboolean g_cond_wait_until(CompatGCond *cond, CompatGMutex *mutex,
++                                         gint64 end_time)
++{
++    GTimeVal time;
++
++    /* Convert from monotonic to CLOCK_REALTIME.  */
++    end_time -= g_get_monotonic_time();
++    g_get_current_time(&time);
++    end_time += time.tv_sec * G_TIME_SPAN_SECOND + time.tv_usec;
++
++    time.tv_sec = end_time / G_TIME_SPAN_SECOND;
++    time.tv_usec = end_time % G_TIME_SPAN_SECOND;
++    return g_cond_timed_wait(cond, mutex, &time);
++}
++
++/* before 2.31 there was no g_thread_new() */
++static inline GThread *g_thread_new(const char *name,
++                                    GThreadFunc func, gpointer data)
++{
++    GThread *thread = g_thread_create(func, data, TRUE, NULL);
++    if (!thread) {
++        g_error("creating thread");
++    }
++    return thread;
++}
++
++#else
++typedef GMutex CompatGMutex;
++typedef GCond CompatGCond;
++#endif
++
++#if !GLIB_CHECK_VERSION(2, 32, 0)
++#define GRecMutex GStaticRecMutex
++#define G_REC_MUTEX_INIT  = G_STATIC_REC_MUTEX_INIT
++#define g_rec_mutex_init g_static_rec_mutex_init
++#define g_rec_mutex_lock g_static_rec_mutex_lock
++#define g_rec_mutex_unlock g_static_rec_mutex_unlock
++#define g_rec_mutex_clear g_static_rec_mutex_free
++#endif
++
+ typedef enum RmDigestType {
+     RM_DIGEST_UNKNOWN = 0,
+     RM_DIGEST_MURMUR,
+@@ -139,8 +335,8 @@ typedef struct RmBufferPool {
+     bool mem_warned;
+ 
+     /* concurrent accesses may happen */
+-    GMutex lock;
+-    GCond change;
++    CompatGMutex lock;
++    CompatGCond change;
+ } RmBufferPool;
+ 
+ /* Represents one block of read data */
+diff --git a/lib/formats.h b/lib/formats.h
+index 59775f3..1be1046 100644
+--- a/lib/formats.h
++++ b/lib/formats.h
+@@ -109,7 +109,7 @@ typedef struct RmFmtHandler {
+     /* mutex to protect against parallel calls.
+      * Handlers do not need to care about it.
+      */
+-    GMutex print_mtx;
++    CompatGMutex print_mtx;
+ 
+     /* A list of valid keys that may be passed to
+      * --config fmt:key.
+diff --git a/lib/hash-utility.c b/lib/hash-utility.c
+index 4c95cae..581627d 100644
+--- a/lib/hash-utility.c
++++ b/lib/hash-utility.c
+@@ -36,7 +36,7 @@ typedef struct RmHasherSession {
+     /* Internal */
+     char **paths;
+     gint path_index;
+-    GMutex lock;
++    CompatGMutex lock;
+     RmDigest **completed_digests_buffer;
+     bool *read_succesful;
+ 
+diff --git a/lib/hasher.c b/lib/hasher.c
+index 75a78fc..c25c904 100644
+--- a/lib/hasher.c
++++ b/lib/hasher.c
+@@ -60,8 +60,8 @@ struct _RmHasher {
+     GAsyncQueue *hashpipe_pool;
+     gint unalloc_hashpipes;
+     GAsyncQueue *return_queue;
+-    GMutex lock;
+-    GCond cond;
++    CompatGMutex lock;
++    CompatGCond cond;
+ 
+     gsize buf_size;
+     guint active_tasks;
+diff --git a/lib/md-scheduler.c b/lib/md-scheduler.c
+index 5cf7c8d..f6efd62 100644
+--- a/lib/md-scheduler.c
++++ b/lib/md-scheduler.c
+@@ -64,8 +64,8 @@ struct _RmMDS {
+     /* Lock for access to:
+      *  self->disks
+      */
+-    GMutex lock;
+-    GCond cond;
++    CompatGMutex lock;
++    CompatGCond cond;
+ 
+     /* flag for whether threadpool is running */
+     gboolean running;
+@@ -101,8 +101,8 @@ struct _RmMDSDevice {
+      *  self->unsorted_tasks
+      *  self->ref_count
+      */
+-    GMutex lock;
+-    GCond cond;
++    CompatGMutex lock;
++    CompatGCond cond;
+ 
+     /* Reference count for self */
+     gint ref_count;
+diff --git a/lib/pathtricia.h b/lib/pathtricia.h
+index 0f5720d..3b63ba6 100644
+--- a/lib/pathtricia.h
++++ b/lib/pathtricia.h
+@@ -28,6 +28,7 @@
+ 
+ #include <glib.h>
+ #include <stdbool.h>
++#include "checksum.h"
+ 
+ typedef struct _RmNode {
+     /* Element of the path */
+@@ -57,7 +58,7 @@ typedef struct _RmTrie {
+     size_t size;
+ 
+     /* read write lock for insert/search */
+-    GMutex lock;
++    CompatGMutex lock;
+ } RmTrie;
+ 
+ /* Callback to rm_trie_iter */
+diff --git a/lib/session.h b/lib/session.h
+index 6bdef65..bd2607e 100644
+--- a/lib/session.h
++++ b/lib/session.h
+@@ -51,7 +51,7 @@ typedef struct RmFileTables {
+     GList *other_lint[RM_LINT_TYPE_DUPE_CANDIDATE];
+ 
+     /* lock for access to *list during traversal */
+-    GMutex lock;
++    CompatGMutex lock;
+ } RmFileTables;
+ 
+ struct RmFmtTable;
+diff --git a/lib/shredder.c b/lib/shredder.c
+index ae24223..1854fb3 100644
+--- a/lib/shredder.c
++++ b/lib/shredder.c
+@@ -306,7 +306,7 @@
+ 
+ typedef struct RmShredTag {
+     RmSession *session;
+-    GMutex hash_mem_mtx;
++    CompatGMutex hash_mem_mtx;
+     gint64 paranoid_mem_alloc; /* how much memory to allocate for paranoid checks */
+     gint32 active_groups; /* how many shred groups active (only used with paranoid) */
+     RmHasher *hasher;
+@@ -317,7 +317,7 @@ typedef struct RmShredTag {
+     gint32 page_size;
+     bool mem_refusing;
+ 
+-    GMutex lock;
++    CompatGMutex lock;
+ 
+     gint32 remaining_files;
+     gint64 remaining_bytes;
+@@ -415,15 +415,15 @@ typedef struct RmShredGroup {
+     RmDigest *digest;
+ 
+     /* lock for access to this RmShredGroup */
+-    GMutex lock;
++    CompatGMutex lock;
+ 
+     /* Reference to main */
+     const RmSession *session;
+ } RmShredGroup;
+ 
+ typedef struct RmSignal {
+-    GMutex lock;
+-    GCond cond;
++    CompatGMutex lock;
++    CompatGCond cond;
+     gboolean done;
+ } RmSignal;
+ 
+@@ -1331,7 +1331,11 @@ static RmShredGroup *rm_shred_create_rejects(RmShredGroup *group, RmFile *file)
+ static void rm_shred_group_transfer(RmFile *file, RmShredGroup *source,
+                                     RmShredGroup *dest) {
+     rm_shred_group_push_file(dest, file, FALSE);
++#if GLIB_CHECK_VERSION(2, 30, 0)
+     rm_assert_gentle(g_queue_remove(source->held_files, file));
++#else
++    g_queue_remove(source->held_files, file);
++#endif
+     source->num_files--;
+     source->n_pref -= file->is_prefd;
+     source->n_npref -= !file->is_prefd;
+diff --git a/lib/utilities.c b/lib/utilities.c
+index 85370e9..618242c 100644
+--- a/lib/utilities.c
++++ b/lib/utilities.c
+@@ -254,7 +254,7 @@ gint rm_util_slist_foreach_remove(GSList **list, RmRFunc func, gpointer user_dat
+     return removed;
+ }
+ 
+-gpointer rm_util_slist_pop(GSList **list, GMutex *lock) {
++gpointer rm_util_slist_pop(GSList **list, CompatGMutex *lock) {
+     gpointer result = NULL;
+     if(lock) {
+         g_mutex_lock(lock);
+diff --git a/lib/utilities.h b/lib/utilities.h
+index b27debe..0d870d8 100644
+--- a/lib/utilities.h
++++ b/lib/utilities.h
+@@ -135,7 +135,7 @@ static inline gint64 rm_sys_preadv(int fd, const struct iovec *iov, int iovcnt,
+ typedef struct RmUserList {
+     GSequence *users;
+     GSequence *groups;
+-    GMutex lock;
++    CompatGMutex lock;
+ } RmUserList;
+ 
+ /**
+@@ -303,7 +303,7 @@ gint rm_util_slist_foreach_remove(GSList **list, RmRFunc func, gpointer user_dat
+ * Note this function returns null if the list is empty, or if the first item
+ * has NULL as its data.
+ */
+-gpointer rm_util_slist_pop(GSList **list, GMutex *lock);
++gpointer rm_util_slist_pop(GSList **list, CompatGMutex *lock);
+ 
+ /**
+  * @brief Return a pointer to the extension part of the file or NULL if none.
+-- 
+2.11.0
+
